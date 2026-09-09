@@ -86,6 +86,25 @@ curl http://<phone-ip>:8753/omarchy/clipboard
 
 # Photos backup (lists DCIM)
 curl -X POST http://<phone-ip>:8753/omarchy/photos/backup
+
+# File browser (list a directory; confined to /sdcard, /storage/emulated/0)
+curl "http://<phone-ip>:8753/omarchy/files?path=/sdcard"
+# → {"path":"/sdcard","parent":"","entries":[{name,path,isDir,size,modified}...]}
+
+# Download a file
+curl -O "http://<phone-ip>:8753/omarchy/file?path=/sdcard/OhmLauncher/shared/x.txt"
+
+# Remote control (needs the Ohm accessibility service ENABLED on the phone)
+curl -X POST http://<phone-ip>:8753/omarchy/input \
+     -H 'Content-Type: application/json' -d '{"action":"tap","x":540,"y":1200}'
+curl -X POST http://<phone-ip>:8753/omarchy/input \
+     -H 'Content-Type: application/json' \
+     -d '{"action":"swipe","x1":540,"y1":1800,"x2":540,"y2":900,"durationMs":400}'
+curl -X POST http://<phone-ip>:8753/omarchy/input \
+     -H 'Content-Type: application/json' -d '{"action":"key","key":"back"}'
+# → {"ok":true} | {"ok":false,"error":"accessibility_disabled"}
+# Same payload as a WS message {"type":"input", ...} on /omarchy/ws
+# (replies {"type":"input_result", ...}).
 ```
 
 ## Common failure modes
@@ -108,6 +127,16 @@ curl -X POST http://<phone-ip>:8753/omarchy/photos/backup
 - **Clipboard push fails with "Cleartext HTTP traffic not permitted"**: the
   phone app needs `android:usesCleartextTraffic="true"` (the contract is
   plain HTTP on the LAN).
+- **Remote input returns `accessibility_disabled`**: enable the Ohm
+  accessibility service (Settings → Accessibility). It requires
+  `android:canPerformGestures="true"` in the service config xml — without it
+  `dispatchGesture()` returns true but the gesture is silently dropped and
+  the `GestureResultCallback` never fires. Also: do not block waiting for
+  that callback to answer the caller (it may never fire); report the
+  synchronous dispatch result instead. After a force-stop the service does
+  not rebind by itself — re-toggle `enabled_accessibility_services`.
+- **Panel file browser empty / 404**: the phone needs the `/omarchy/files`
+  endpoint (contract v2). Downloads use `GET /omarchy/file?path=`.
 
 ## Emulator lab (Omarchy in QEMU + Android emulator inside the guest)
 

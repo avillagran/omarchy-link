@@ -47,7 +47,7 @@ def _screen_path_for(raw: bytes) -> str:
     return "/tmp/omarchy-screen.png"
 
 
-def write_screen_frame(raw: bytes) -> None:
+def write_screen_frame(raw: bytes, w: int = 0, h: int = 0) -> None:
     global _frame_count
     try:
         path = _screen_path_for(raw)
@@ -57,7 +57,8 @@ def write_screen_frame(raw: bytes) -> None:
             _frame_count += 1
             with open(SCREEN_STATE_FILE, "w", encoding="utf-8") as s:
                 import time
-                json.dump({"frames": _frame_count, "last": time.time()}, s)
+                json.dump({"frames": _frame_count, "last": time.time(),
+                           "w": w, "h": h}, s)
             if _frame_count % 30 == 0:
                 log("frame %d received (%d bytes)" % (_frame_count, len(raw)))
     except OSError:
@@ -218,10 +219,16 @@ class Handler(BaseHTTPRequestHandler):
             write_state({"connected": False, "peerIp": "", "peerPort": 8753,
                          "peerName": "", "linkPort": PORT})
             self._json(200, {"connected": False})
-        elif self.path == "/omarchy/screen/frame":
+        elif self.path.startswith("/omarchy/screen/frame"):
             try:
                 raw = self._read_body()
-                write_screen_frame(raw)
+                # Phone pixel size arrives as ?w=&h= so the panel can map
+                # remote-control taps back onto the phone screen.
+                from urllib.parse import urlparse, parse_qs
+                q = parse_qs(urlparse(self.path).query)
+                w = int(q.get("w", ["0"])[0] or 0)
+                h = int(q.get("h", ["0"])[0] or 0)
+                write_screen_frame(raw, w, h)
                 self._json(200, {"ok": True, "bytes": len(raw)})
             except (ValueError, OSError):
                 self._json(500, {"error": "frame_write_failed"})

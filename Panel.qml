@@ -37,6 +37,13 @@ Panel {
   property bool showLog: false
   property bool screenSharing: false
   property int frameCount: 0
+  // Phone pixel size (from /omarchy/screen/status) for remote-control mapping.
+  property int screenW: 0
+  property int screenH: 0
+  // File browser state.
+  property bool showFiles: false
+  property string filesPath: "/sdcard"
+  property string filesParent: ""
 
   property var anchorItem: null
   property var hostWidget: null
@@ -141,6 +148,59 @@ Panel {
     }
     x.send()
   }
+
+  // --- Remote control -----------------------------------------------------
+
+  // Send an input event to the phone: {action:'tap'|'swipe'|'key', ...}.
+  function sendInput(obj) {
+    const x = new XMLHttpRequest()
+    x.open("POST", base() + "/omarchy/input")
+    x.setRequestHeader("Content-Type", "application/json")
+    x.onreadystatechange = function () {
+      if (x.readyState === XMLHttpRequest.DONE) {
+        try {
+          const r = JSON.parse(x.responseText)
+          if (r.ok !== true) log("input " + obj.action + " -> " + (r.error || x.status))
+        } catch (e) { log("input " + obj.action + " -> " + x.status) }
+      }
+    }
+    x.send(JSON.stringify(obj))
+  }
+
+  // Map a point inside screenImage (PreserveAspectFit) to phone pixels.
+  function mapToPhone(mx, my) {
+    if (root.screenW <= 0 || root.screenH <= 0) return null
+    const scale = Math.min(screenImage.width / root.screenW, screenImage.height / root.screenH)
+    const dw = root.screenW * scale, dh = root.screenH * scale
+    const ox = (screenImage.width - dw) / 2, oy = (screenImage.height - dh) / 2
+    const px = (mx - ox) / scale, py = (my - oy) / scale
+    if (px < 0 || py < 0 || px > root.screenW || py > root.screenH) return null
+    return { x: Math.round(px), y: Math.round(py) }
+  }
+
+  // --- File browser ---------------------------------------------------------
+
+  function loadFiles(path) {
+    getJson("/omarchy/files?path=" + encodeURIComponent(path), function (d) {
+      root.filesPath = d.path || path
+      root.filesParent = d.parent || ""
+      filesModel.clear()
+      for (const e of (d.entries || [])) {
+        filesModel.append({ name: e.name, path: e.path, isDir: e.isDir === true, size: e.size || 0 })
+      }
+    }, function (c) { log("files failed: " + c) })
+  }
+
+  function downloadFile(path, name) {
+    // bash expands $HOME; mkdir -p so first download never fails.
+    const url = base() + "/omarchy/file?path=" + encodeURIComponent(path)
+    dlProc.command = ["bash", "-c",
+      "mkdir -p \"$HOME/Downloads\" && curl -sSL -o \"$HOME/Downloads/" + name + "\" \"" + url + "\""]
+    dlProc.running = true
+    log("downloading " + name)
+  }
+  Process { id: dlProc; running: false; command: ["true"]
+    onExited: function (code) { log(code === 0 ? "download ok" : "download failed: " + code) } }
 
   // Apply the Omarchy theme on the phone (PUT /omarchy/theme). The phone decides
   // the concrete theme; we send a hint (dark by default).
@@ -289,7 +349,13 @@ Panel {
           Row {
             spacing: Style.space(6)
             WidgetButton { text: i18n.t("files"); bar: root.bar
-              onPressed: function (b) { if (b === 1) root.postOnly("/omarchy/file") } }
+              onPressed: function (b) {
+                if (b === 1) {
+                  root.showFiles = !root.showFiles
+                  if (root.showFiles) root.loadFiles(root.filesPath)
+                }
+              }
+            }
             WidgetButton { text: i18n.t("copyToPhone"); bar: root.bar
               onPressed: function (b) { if (b === 1) root.pushClipboard("hello from Omarchy") } }
           }
@@ -309,8 +375,70 @@ Panel {
           }
         }
 
-        // Screen-share viewer (phone -> pc). Shows the latest frame saved by
-        // link_server.py (/omarchy/screen/frame) while screenSharing is active.
+        // File browser (browse the phone's shared storage; tap a file to
+        // download it to ~/Downloads on this pc).
+        Column {
+          visible: root.showFiles
+          opacity: root.showFiles ? 1 : 0
+          Behavior on opacity { NumberAnimation { duration: 200 } }
+          spacing: Style.space(4)
+          width: parent.width
+
+          ListModel { id: filesModel }
+
+          Text {
+            width: parent.width
+            text: root.filesPath
+            color: root.barForeground
+            opacity: 0.7
+            elide: Text.ElideLeft
+            font.family: "monospace"
+            font.pixelSize: Style.font.caption
+          }
+          WidgetButton {
+            visible: root.filesParent !== ""
+            text: ".."
+            bar: root.bar
+            onPressed: function (b) { if (b === 1) root.loadFiles(root.filesParent) }
+          }
+          ListView {
+            width: parent.width
+            height: 160
+            clip: true
+            model: filesModel
+            delegate: Rectangle {
+              width: ListView.view.width
+              height: 22
+              color: fileArea.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+              radius: 4
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.left: parent.left
+                anchors.leftMargin: 6
+                width: parent.width - 12
+                text: (model.isDir ? "📁 " : "📄 ") + model.name
+                color: root.barForeground
+                elide: Text.ElideRight
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+              MouseArea {
+                id: fileArea
+                anchors.fill: parent
+                hoverEnabled: true
+                onClicked: {
+                  if (model.isDir) root.loadFiles(model.path)
+                  else root.downloadFile(model.path, model.name)
+                }
+              }
+            }
+          }
+        }
+
+        // Screen-share viewer (phone -> pc) + REMOTE CONTROL (pc -> phone).
+        // Tap on the image = tap on the phone; drag = swipe. Coordinates are
+        // mapped through PreserveAspectFit using the phone pixel size reported
+        // in /omarchy/screen/status.
         Image {
           id: screenImage
           visible: root.screenSharing
@@ -318,6 +446,35 @@ Panel {
           fillMode: Image.PreserveAspectFit
           source: "file:///tmp/omarchy-screen.jpg"
           anchors.horizontalCenter: parent.horizontalCenter
+          MouseArea {
+            anchors.fill: parent
+            property real pressX: 0
+            property real pressY: 0
+            onPressed: function (m) { pressX = m.x; pressY = m.y }
+            onReleased: function (m) {
+              const p1 = root.mapToPhone(pressX, pressY)
+              const p2 = root.mapToPhone(m.x, m.y)
+              if (!p1 || !p2) return
+              const dx = p2.x - p1.x, dy = p2.y - p1.y
+              if (Math.sqrt(dx * dx + dy * dy) < 30)
+                root.sendInput({ action: "tap", x: p2.x, y: p2.y })
+              else
+                root.sendInput({ action: "swipe", x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, durationMs: 300 })
+            }
+          }
+        }
+
+        // Navigation keys for remote control (global actions on the phone).
+        Row {
+          visible: root.screenSharing
+          spacing: Style.space(6)
+          anchors.horizontalCenter: parent.horizontalCenter
+          WidgetButton { text: "◀"; bar: root.bar
+            onPressed: function (b) { if (b === 1) root.sendInput({ action: "key", key: "back" }) } }
+          WidgetButton { text: "●"; bar: root.bar
+            onPressed: function (b) { if (b === 1) root.sendInput({ action: "key", key: "home" }) } }
+          WidgetButton { text: "■"; bar: root.bar
+            onPressed: function (b) { if (b === 1) root.sendInput({ action: "key", key: "recents" }) } }
         }
 
         // Receiving status: polls the local link server for the frame counter.
@@ -342,7 +499,12 @@ Panel {
             x.open("GET", "http://127.0.0.1:" + root.linkPort + "/omarchy/screen/status")
             x.onreadystatechange = function () {
               if (x.readyState === XMLHttpRequest.DONE) {
-                try { var j = JSON.parse(x.responseText); root.frameCount = j.frames } catch (e) {}
+                try {
+                  var j = JSON.parse(x.responseText)
+                  root.frameCount = j.frames
+                  if (j.w) root.screenW = j.w
+                  if (j.h) root.screenH = j.h
+                } catch (e) {}
               }
             }
             x.send()
