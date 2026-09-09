@@ -96,3 +96,41 @@ curl -X POST http://<phone-ip>:8753/omarchy/photos/backup
   Quickshell/Omarchy; if absent, the Image just stays empty (non-fatal).
 - **connect() fails**: phone API server not running, or wrong port (must be
   8753), or firewall blocking LAN. Check `curl /omarchy/discover` first.
+- **Link state stuck at `peerName: "phone"` / empty POST bodies**: dart:io's
+  `HttpClient` sends `Transfer-Encoding: chunked` unless `contentLength` is
+  set, and Python's `http.server` cannot decode chunked bodies (it reads 0
+  bytes). The launcher sets `contentLength` explicitly; link_server also
+  decodes chunked defensively (`_read_body`). If you add another phone→PC
+  POST, set `req.contentLength` or the body will silently vanish.
+- **Server wedges after ~30 screen frames**: `write_screen_frame()` holds the
+  state lock and calls `log()` every 30th frame — with a plain
+  `threading.Lock` that self-deadlocks. It must stay a `threading.RLock`.
+- **Clipboard push fails with "Cleartext HTTP traffic not permitted"**: the
+  phone app needs `android:usesCleartextTraffic="true"` (the contract is
+  plain HTTP on the LAN).
+
+## Emulator lab (Omarchy in QEMU + Android emulator inside the guest)
+
+Fully offline end-to-end setup used to develop this contract:
+
+1. In the Omarchy guest: install cmdline-tools + `emulator` +
+   `system-images;android-34;default;x86_64` (a portable JRE in `$HOME/jdk`
+   works for sdkmanager; nested KVM must expose `/dev/kvm`).
+2. Start the emulator headless:
+   `emulator -avd ohmtest -no-window -no-audio -gpu swiftshader_indirect -accel on`
+   and install the OhmLauncher APK with `adb install -r`.
+3. Grant storage: `adb shell appops set cl.villagranquiroz.ohm_launcher MANAGE_EXTERNAL_STORAGE allow`.
+4. Networking (emulator NAT, no LAN):
+   - Guest → phone: `adb forward tcp:8753 tcp:8753` (guest `127.0.0.1:8753`).
+   - Phone → guest: the emulator reaches the guest at `10.0.2.2`.
+   - Run link_server on a different port with a peer rewrite so the panel
+     calls the phone through the forward:
+     `OMARCHY_LINK_PORT=8763 OMARCHY_LINK_PEER=127.0.0.1:8753 python3 link_server.py`
+5. Simulate scanning the QR (no camera in the emulator):
+   `adb shell am start -a android.intent.action.VIEW -d "omarchy://10.0.2.2:8763?id=<hostname>"`
+6. MediaProjection consent: `POST /omarchy/screen/start`, then dump
+   `uiautomator` and `input tap` the "START NOW" button. Frames land in
+   `/tmp/omarchy-screen.jpg` (`GET /omarchy/screen/status` counts them).
+7. Drive the VM bar/panel without a VNC viewer: QMP `screendump` +
+   `input-send-event` (absolute pointer, range 0..32767); find the green
+   Android icon by pixel scan (#4caf50) instead of guessing coordinates.

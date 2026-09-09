@@ -31,6 +31,9 @@ Panel {
   property string peerName: ""
   property string peerIp: ""
   property int peerPort: 8753
+  // Port of THIS pc's link_server (for local status polls + QR generation).
+  // Reported by link_server.py in the state file so the panel never assumes 8753.
+  property int linkPort: 8753
   property bool showLog: false
   property bool screenSharing: false
   property int frameCount: 0
@@ -45,6 +48,8 @@ Panel {
       root.connected = d.connected === true
       root.peerIp = d.peerIp || ""
       root.peerName = d.peerName || ""
+      if (d.peerPort) root.peerPort = parseInt(d.peerPort, 10)
+      if (d.linkPort) root.linkPort = parseInt(d.linkPort, 10)
     } catch (e) { /* ignore malformed */ }
   }
 
@@ -149,7 +154,7 @@ Panel {
   function regenerateQr() {
     qrProc.command = ["bash",
       Qt.resolvedUrl("make_qr.sh").toString().replace("file://", ""),
-      "", "8753", "omarchy-pc"]
+      "", String(root.linkPort), "omarchy-pc"]
     qrProc.running = true
   }
 
@@ -334,7 +339,7 @@ Panel {
             screenImage.source = ""
             screenImage.source = "file:///tmp/omarchy-screen.jpg"
             var x = new XMLHttpRequest()
-            x.open("GET", "http://127.0.0.1:" + root.peerPort + "/omarchy/screen/status")
+            x.open("GET", "http://127.0.0.1:" + root.linkPort + "/omarchy/screen/status")
             x.onreadystatechange = function () {
               if (x.readyState === XMLHttpRequest.DONE) {
                 try { var j = JSON.parse(x.responseText); root.frameCount = j.frames } catch (e) {}

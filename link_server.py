@@ -23,8 +23,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 STATE_FILE = "/tmp/omarchy-link-state.json"
 SCREEN_FILE = "/tmp/omarchy-screen.png"
 HOST = "0.0.0.0"
-PORT = 8753
-_lock = threading.Lock()
+# Port is configurable so the emulator lab can run this server on a different
+# port than the adb-forwarded phone API (both default to 8753 otherwise).
+PORT = int(os.environ.get("OMARCHY_LINK_PORT", "8753"))
+# Optional "ip:port" rewrite of the phone address stored in the state file.
+# Lab use: the emulator's NAT IP is unreachable from the PC, which instead
+# reaches the phone through `adb forward` on 127.0.0.1. On a real LAN this
+# stays unset and the phone's self-reported IP is used as-is.
+PEER_OVERRIDE = os.environ.get("OMARCHY_LINK_PEER", "")
+# RLock (not Lock): write_screen_frame() holds it and calls log() at every
+# 30th frame; a plain Lock self-deadlocks there and wedges the whole server.
+_lock = threading.RLock()
 
 
 SCREEN_STATE_FILE = "/tmp/omarchy-screen-state.json"
@@ -73,6 +82,32 @@ def log(msg: str) -> None:
         pass
 
 
+def _wl_set_clipboard(text: str) -> bool:
+    """Copy text into the desktop clipboard (wl-copy on Wayland, xclip on X11)."""
+    import subprocess
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), timeout=3,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def _wl_get_clipboard() -> str:
+    """Read the desktop clipboard (wl-paste on Wayland, xclip on X11)."""
+    import subprocess
+    for cmd in (["wl-paste", "-n"], ["xclip", "-selection", "clipboard", "-o"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=3)
+            if out.returncode == 0:
+                return out.stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return ""
+
+
 def write_state(state: dict) -> None:
     try:
         with _lock:
@@ -89,13 +124,38 @@ def read_state() -> dict:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
     except (OSError, ValueError):
-        return {"connected": False, "peerIp": "", "peerName": ""}
+        return {"connected": False, "peerIp": "", "peerPort": 8753,
+                "peerName": "", "linkPort": PORT}
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _read_body(self) -> bytes:
+        """Read the request body, decoding Transfer-Encoding: chunked when
+        present (dart:io's HttpClient sends chunked unless contentLength is
+        set, and http.server does not decode it by itself)."""
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            out = bytearray()
+            while True:
+                size_line = self.rfile.readline(65536).strip()
+                try:
+                    size = int(size_line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    # Consume trailers up to the blank line.
+                    while self.rfile.readline(65536) not in (b"\r\n", b"\n", b""):
+                        pass
+                    break
+                out += self.rfile.read(size)
+                self.rfile.read(2)  # trailing CRLF
+            return bytes(out)
+        length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(length) if length else b""
+
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _json(self, code: int, payload: dict) -> None:
@@ -117,35 +177,70 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, read_state())
         elif self.path == "/omarchy/screen/status":
             self._json(200, read_screen_state())
+        elif self.path == "/omarchy/clipboard":
+            self._json(200, {"text": _wl_get_clipboard()})
         else:
             self._json(404, {"error": "not found"})
+
+    @staticmethod
+    def _peer_from(data: dict) -> tuple:
+        """Resolve the phone address the panel should call. PEER_OVERRIDE wins
+        (emulator lab); otherwise the phone's self-reported ip (+api port)."""
+        if PEER_OVERRIDE:
+            ip, _, port = PEER_OVERRIDE.partition(":")
+            return ip, int(port or "8753")
+        ip = str(data.get("ip", ""))
+        try:
+            port = int(data.get("port", 8753))
+        except (TypeError, ValueError):
+            port = 8753
+        return ip, port
 
     def do_POST(self):
         if self.path == "/omarchy/link":
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length) if length else b"{}"
+                raw = self._read_body()
                 data = json.loads(raw.decode("utf-8") or "{}")
             except (ValueError, OSError):
-                data = {}
+                raw, data = b"", {}
+            log("link POST from %s body=%s" % (self.client_address[0], raw[:200]))
+            ip, port = self._peer_from(data)
             state = {
                 "connected": True,
-                "peerIp": str(data.get("ip", "")),
+                "peerIp": ip,
+                "peerPort": port,
                 "peerName": str(data.get("name", "phone")),
+                "linkPort": PORT,
             }
             write_state(state)
             self._json(200, state)
         elif self.path == "/omarchy/link/bye":
-            write_state({"connected": False, "peerIp": "", "peerName": ""})
+            write_state({"connected": False, "peerIp": "", "peerPort": 8753,
+                         "peerName": "", "linkPort": PORT})
             self._json(200, {"connected": False})
         elif self.path == "/omarchy/screen/frame":
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length) if length else b""
+                raw = self._read_body()
                 write_screen_frame(raw)
                 self._json(200, {"ok": True, "bytes": len(raw)})
             except (ValueError, OSError):
                 self._json(500, {"error": "frame_write_failed"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        # Phone (ClipboardMonitorService) pushes copied text here; mirror it
+        # into the Wayland clipboard so it is paste-able on the desktop.
+        if self.path == "/omarchy/clipboard":
+            try:
+                raw = self._read_body()
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, OSError):
+                data = {}
+            text = str(data.get("text", ""))
+            ok = _wl_set_clipboard(text)
+            log("clipboard PUT (%d chars) wl-copy=%s" % (len(text), ok))
+            self._json(200 if ok else 500, {"ok": ok, "chars": len(text)})
         else:
             self._json(404, {"error": "not found"})
 
@@ -154,9 +249,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    # Start from a clean (disconnected) state.
-    write_state({"connected": False, "peerIp": "", "peerName": ""})
+    # Bind BEFORE writing the clean state: if another instance already owns the
+    # port (e.g. one started manually or by a previous panel open), this process
+    # must fail here without resetting the shared state file to "disconnected".
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    # Start from a clean (disconnected) state.
+    write_state({"connected": False, "peerIp": "", "peerPort": 8753,
+                 "peerName": "", "linkPort": PORT})
+    log("link server listening on %s:%d" % (HOST, PORT))
     srv.serve_forever()
 
 
