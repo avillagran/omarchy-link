@@ -16,9 +16,14 @@ via a FileView, so the bar icon turns green and the panel shows "Conectado".
 """
 
 import json
+import ipaddress
 import os
+import re
+import subprocess
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 STATE_FILE = "/tmp/omarchy-link-state.json"
 SCREEN_FILE = "/tmp/omarchy-screen.png"
@@ -34,6 +39,7 @@ PEER_OVERRIDE = os.environ.get("OMARCHY_LINK_PEER", "")
 # RLock (not Lock): write_screen_frame() holds it and calls log() at every
 # 30th frame; a plain Lock self-deadlocks there and wedges the whole server.
 _lock = threading.RLock()
+_COLOR = re.compile(r"^#[0-9a-fA-F]{3,4}(?:[0-9a-fA-F]{3,4})?$")
 
 
 SCREEN_STATE_FILE = "/tmp/omarchy-screen-state.json"
@@ -129,6 +135,136 @@ def read_state() -> dict:
                 "peerName": "", "linkPort": PORT}
 
 
+def read_omarchy_theme(home=None) -> dict:
+    """Read Omarchy's canonical current colors.toml into the phone contract."""
+    root = Path(home or Path.home()) / ".local/state/omarchy/current"
+    colors_file = root / "theme/colors.toml"
+    try:
+        import tomllib
+        with colors_file.open("rb") as source:
+            raw = tomllib.load(source)
+    except (OSError, ValueError):
+        return {"name": "Omarchy", "mode": "dark", "source": "omarchy", "colors": {}}
+    mode = str(raw.get("mode", "dark")).lower()
+    if mode not in ("dark", "light"):
+        mode = "dark"
+    colors = {
+        str(key): value
+        for key, value in raw.items()
+        if isinstance(value, str) and _COLOR.fullmatch(value)
+    }
+    try:
+        name = (root / "theme.name").read_text(encoding="utf-8").strip()
+    except OSError:
+        name = ""
+    return {
+        "name": name or colors_file.parent.name or "Omarchy",
+        "mode": mode,
+        "source": "omarchy",
+        "colors": colors,
+    }
+
+
+def push_theme_to_phone(state: dict, payload: dict, opener=urllib.request.urlopen) -> bool:
+    if not state.get("connected") or not state.get("peerIp") or not payload.get("colors"):
+        return False
+    host = str(state["peerIp"])
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    try:
+        port = int(state.get("peerPort", 8753))
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            "http://%s:%d/omarchy/theme" % (host, port),
+            data=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+            method="PUT",
+        )
+        with opener(request, timeout=5) as response:
+            return 200 <= int(response.status) < 300
+    except (OSError, ValueError):
+        return False
+
+
+def parse_avahi_peer(output: str):
+    candidates = []
+    for line in output.splitlines():
+        fields = line.split(";")
+        if len(fields) < 9 or fields[0] != "=" or fields[4] != "_ohm._tcp":
+            continue
+        try:
+            address = str(ipaddress.ip_address(fields[7]))
+            port = int(fields[8])
+        except ValueError:
+            continue
+        if port not in range(1, 65536):
+            continue
+        candidates.append((fields[2] != "IPv4", {
+            "connected": True,
+            "peerIp": address,
+            "peerPort": port,
+            "peerName": fields[3].replace("\\032", " "),
+        }))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def discover_phone() -> dict:
+    try:
+        result = subprocess.run(
+            ["avahi-browse", "-rtp", "_ohm._tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return parse_avahi_peer(result.stdout) or {}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
+def sync_theme_once(
+    last_payload: str,
+    payload_reader=read_omarchy_theme,
+    state_reader=read_state,
+    discover=discover_phone,
+    push=push_theme_to_phone,
+    state_writer=write_state,
+) -> str:
+    """Synchronize once and persist reverse mDNS discovery for the panel."""
+    payload = payload_reader()
+    encoded = json.dumps(payload, sort_keys=True)
+    state = state_reader()
+    discovered = False
+    if not state.get("connected"):
+        state = discover()
+        discovered = bool(state.get("connected"))
+    if not state.get("connected"):
+        return last_payload
+    if encoded == last_payload and not discovered:
+        return last_payload
+    if not push(state, payload):
+        return last_payload
+    persisted = dict(state)
+    persisted["linkPort"] = PORT
+    state_writer(persisted)
+    return encoded
+
+
+def theme_sync_loop(stop_event=None) -> None:
+    """Push every actual Omarchy palette change to the connected launcher."""
+    stopped = stop_event or threading.Event()
+    last_payload = ""
+    while not stopped.wait(1.0):
+        payload = read_omarchy_theme()
+        encoded = json.dumps(payload, sort_keys=True)
+        updated = sync_theme_once(last_payload, payload_reader=lambda: payload)
+        if updated != last_payload:
+            log("theme sync -> %s (ok)" % payload.get("name"))
+        elif encoded != last_payload:
+            log("theme sync -> %s (not connected)" % payload.get("name"))
+        last_payload = updated
+
+
 class Handler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes:
         """Read the request body, decoding Transfer-Encoding: chunked when
@@ -180,6 +316,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, read_screen_state())
         elif self.path == "/omarchy/clipboard":
             self._json(200, {"text": _wl_get_clipboard()})
+        elif self.path == "/omarchy/theme":
+            self._json(200, read_omarchy_theme())
         else:
             self._json(404, {"error": "not found"})
 
@@ -214,11 +352,22 @@ class Handler(BaseHTTPRequestHandler):
                 "linkPort": PORT,
             }
             write_state(state)
+            threading.Thread(
+                target=lambda: push_theme_to_phone(state, read_omarchy_theme()),
+                daemon=True,
+            ).start()
             self._json(200, state)
         elif self.path == "/omarchy/link/bye":
             write_state({"connected": False, "peerIp": "", "peerPort": 8753,
                          "peerName": "", "linkPort": PORT})
             self._json(200, {"connected": False})
+        elif self.path == "/omarchy/theme/push":
+            payload = read_omarchy_theme()
+            state = read_state()
+            if not state.get("connected"):
+                state = discover_phone()
+            ok = push_theme_to_phone(state, payload)
+            self._json(200 if ok else 503, {"ok": ok, "theme": payload.get("name", "Omarchy")})
         elif self.path.startswith("/omarchy/screen/frame"):
             try:
                 raw = self._read_body()
@@ -264,6 +413,7 @@ def main() -> None:
     write_state({"connected": False, "peerIp": "", "peerPort": 8753,
                  "peerName": "", "linkPort": PORT})
     log("link server listening on %s:%d" % (HOST, PORT))
+    threading.Thread(target=theme_sync_loop, daemon=True, name="omarchy-theme-sync").start()
     srv.serve_forever()
 
 
